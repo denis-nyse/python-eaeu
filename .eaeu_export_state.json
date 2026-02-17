@@ -1,0 +1,22 @@
+{
+  "countries": {
+    "KG|all": {
+      "next_skip": 300,
+      "written_in_run": 300,
+      "done": false,
+      "client_filter_active": false,
+      "updated_at": "2026-02-13T17:34:42Z"
+    }
+  },
+  "signature": {
+    "countries": [
+      "KG"
+    ],
+    "updated_from": null,
+    "date_filter_mode": "auto",
+    "slice_by": "none",
+    "slice_date_field": "docStartDate",
+    "slice_start": "2015-01-01",
+    "slice_end": "2026-02-13"
+  }
+}

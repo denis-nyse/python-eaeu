@@ -1,11 +1,13 @@
 import argparse
 import ast
+import csv
 import json
 import time
 from datetime import datetime, timezone
 
-import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 BASE_URL = "https://tech.eaeunion.org/spd/find"
 COLLECTION_NAME = "kbdallread.service-prop-35_1-conformityDocDetailsType"
@@ -19,12 +21,88 @@ COUNTRY_NAMES_RU = {
     "KZ": "Казахстан",
     "RU": "Россия",
 }
+OUTPUT_COLUMNS = [
+    "Регистрационный номер документа",
+    "Страна",
+    "Вид документа",
+    "Срок действия",
+    "Заявитель",
+    "Изготовитель",
+    "Технический регламент",
+    "Наименование органа по оценке соответствия",
+    "Статус действия",
+]
+REQUEST_TIMEOUT_SECONDS = 60
+MAX_REQUEST_RETRIES = 6
+RETRY_BACKOFF_SECONDS = 1.0
+
+
+class CsvPartWriter:
+    def __init__(self, filename: str, max_rows_per_file: int, fieldnames: list[str]):
+        if max_rows_per_file <= 0:
+            raise ValueError("--max-rows-per-file должен быть больше 0.")
+        self.filename = filename
+        self.max_rows_per_file = max_rows_per_file
+        self.fieldnames = fieldnames
+
+        self._file = None
+        self._writer = None
+        self._rows_in_part = 0
+        self._part_index = 0
+        self.total_rows = 0
+        self.files_created: list[str] = []
+
+    def _split_name(self, part_index: int) -> str:
+        if "." in self.filename:
+            base, ext = self.filename.rsplit(".", 1)
+            ext = f".{ext}"
+        else:
+            base, ext = self.filename, ".csv"
+
+        if part_index == 1:
+            return self.filename
+        return f"{base}_part{part_index:03d}{ext}"
+
+    def _open_next_file(self) -> None:
+        self.close_current()
+        self._part_index += 1
+        path = self._split_name(self._part_index)
+        self._file = open(path, "w", newline="", encoding="utf-8-sig")
+        self._writer = csv.DictWriter(self._file, fieldnames=self.fieldnames, delimiter=";")
+        self._writer.writeheader()
+        self._rows_in_part = 0
+        self.files_created.append(path)
+        print(f"Открыт файл: {path}")
+
+    def close_current(self) -> None:
+        if self._file is not None:
+            self._file.close()
+        self._file = None
+        self._writer = None
+
+    def write_row(self, row: dict[str, str]) -> None:
+        if self._writer is None:
+            self._open_next_file()
+
+        if self._rows_in_part >= self.max_rows_per_file:
+            self._open_next_file()
+
+        self._writer.writerow(row)
+        self._rows_in_part += 1
+        self.total_rows += 1
+
+    def write_rows(self, rows: list[dict[str, str]]) -> None:
+        for row in rows:
+            self.write_row(row)
+
+    def close(self) -> None:
+        self.close_current()
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Выгрузка данных ЕАЭС через REST API в CSV. "
+            "Потоковая выгрузка данных ЕАЭС через REST API в CSV. "
             "Поддерживает выбор одной, нескольких или всех стран."
         )
     )
@@ -58,18 +136,24 @@ def parse_args() -> argparse.Namespace:
         default=10000,
         help="Максимум строк в одном CSV файле (по умолчанию 10000).",
     )
-    parser.add_argument(
-        "--readable-output",
-        action="store_true",
-        help="Дополнительно сохранять расширенный читаемый CSV со всеми доступными полями.",
-    )
-    parser.add_argument(
-        "--readable-drop-empty-threshold",
-        type=float,
-        default=0.95,
-        help="Удалять колонки, где доля пустых значений >= порога (по умолчанию 0.95).",
-    )
     return parser.parse_args()
+
+
+def create_http_session() -> requests.Session:
+    retry = Retry(
+        total=MAX_REQUEST_RETRIES,
+        connect=MAX_REQUEST_RETRIES,
+        read=MAX_REQUEST_RETRIES,
+        backoff_factor=RETRY_BACKOFF_SECONDS,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset({"POST"}),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 
 def ask_countries_interactive() -> list[str]:
@@ -110,133 +194,7 @@ def normalize_countries(raw_value: str) -> list[str]:
             f"Разрешены: {', '.join(VALID_COUNTRY_CODES)}."
         )
 
-    # Удаляем дубликаты с сохранением порядка
     return list(dict.fromkeys(countries))
-
-
-def fetch_data_for_country(country_code: str, limit: int, sleep_seconds: float) -> list[object]:
-    headers = {"Content-Type": "text/plain"}
-    query_payload = {
-        "$and": [
-            {
-                COUNTRY_FIELD: {
-                    "$eq": country_code,
-                }
-            }
-        ]
-    }
-
-    all_data: list[object] = []
-    skip = 0
-    batch_count = 1
-
-    print(f"\nСтарт выгрузки страны {country_code} (limit={limit})")
-
-    while True:
-        url = f"{BASE_URL}?collection={COLLECTION_NAME}&limit={limit}&skip={skip}"
-        response = requests.post(
-            url,
-            headers=headers,
-            data=json.dumps(query_payload),
-            timeout=60,
-        )
-        response.raise_for_status()
-
-        payload = response.json()
-
-        if isinstance(payload, list):
-            data = payload
-        elif isinstance(payload, dict):
-            # На разных стендах API может возвращать данные в обертке.
-            data = (
-                payload.get("data")
-                or payload.get("items")
-                or payload.get("result")
-                or []
-            )
-            if not isinstance(data, list):
-                data = [data]
-        else:
-            data = [payload]
-
-        if not data:
-            print(f"{country_code}: данные закончились.")
-            break
-
-        print(
-            f"{country_code} | пачка #{batch_count}: {len(data)} записей "
-            f"(skip={skip})"
-        )
-        all_data.extend(data)
-
-        if len(data) < limit:
-            print(f"{country_code}: последняя пачка.")
-            break
-
-        skip += limit
-        batch_count += 1
-        time.sleep(sleep_seconds)
-
-    print(f"{country_code}: всего получено {len(all_data)} записей.")
-    return all_data
-
-
-def records_to_dicts(records: list[object], country_code: str) -> list[dict]:
-    normalized: list[dict] = []
-
-    for index, item in enumerate(records):
-        if isinstance(item, dict):
-            row = item.copy()
-        elif isinstance(item, str):
-            stripped = item.strip()
-            parsed = None
-            if stripped:
-                try:
-                    parsed = json.loads(stripped)
-                except json.JSONDecodeError:
-                    parsed = None
-
-            if isinstance(parsed, dict):
-                row = parsed
-            else:
-                row = {
-                    "_raw_value": item,
-                    "_raw_type": "str",
-                }
-        elif isinstance(item, list):
-            row = {
-                "_raw_value": json.dumps(item, ensure_ascii=False),
-                "_raw_type": "list",
-            }
-        else:
-            row = {
-                "_raw_value": item,
-                "_raw_type": type(item).__name__,
-            }
-
-        # Гарантируем поле страны для дальнейшей сортировки и анализа.
-        row.setdefault(COUNTRY_FIELD, country_code)
-        row.setdefault("_source_country", country_code)
-        row.setdefault("_source_index", index)
-        normalized.append(row)
-
-    return normalized
-
-
-def ensure_dict_records(records: list[object]) -> list[dict]:
-    safe: list[dict] = []
-    for index, item in enumerate(records):
-        if isinstance(item, dict):
-            safe.append(item)
-        else:
-            safe.append(
-                {
-                    "_raw_value": item,
-                    "_raw_type": type(item).__name__,
-                    "_source_index": index,
-                }
-            )
-    return safe
 
 
 def output_name(countries: list[str], explicit_name: str) -> str:
@@ -247,14 +205,14 @@ def output_name(countries: list[str], explicit_name: str) -> str:
     return f"export_{suffix}_{stamp}.csv"
 
 
-def readable_output_name(filename: str) -> str:
-    if "." in filename:
-        base, ext = filename.rsplit(".", 1)
-        return f"{base}_readable.{ext}"
-    return f"{filename}_readable.csv"
+def parse_structured_value(value):
+    if value is None:
+        return ""
+    if isinstance(value, (list, dict)):
+        return value
+    if not isinstance(value, str):
+        return value
 
-
-def parse_structured_value(value: str):
     text = value.strip()
     if not text or text in {"[]", "{}", "None", "nan", "NaN", "null"}:
         return ""
@@ -281,6 +239,7 @@ def flatten_for_humans(value) -> str:
         items = [flatten_for_humans(item) for item in value]
         items = [item for item in items if item]
         return " | ".join(items)
+
     if isinstance(value, dict):
         parts = []
         for key, raw in value.items():
@@ -295,47 +254,108 @@ def flatten_for_humans(value) -> str:
     return text
 
 
-def to_ddmmyyyy(value: str) -> str:
-    text = value.strip() if isinstance(value, str) else ""
+def get_nested(obj: dict, path: str, default=""):
+    current = obj
+    for part in path.split("."):
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        else:
+            return default
+    return current
+
+
+def get_value(record: dict, path: str, default=""):
+    if path in record:
+        return record.get(path, default)
+    return get_nested(record, path, default)
+
+
+def get_date_value(record: dict, field_name: str):
+    direct = get_value(record, field_name, "")
+    if isinstance(direct, dict):
+        nested = direct.get("$date", "")
+        if nested:
+            return nested
+    if direct:
+        return direct
+
+    dotted = get_value(record, f"{field_name}.$date", "")
+    if dotted:
+        return dotted
+
+    return ""
+
+
+def normalize_record(item: object, country_code: str) -> dict:
+    if isinstance(item, dict):
+        row = item.copy()
+    elif isinstance(item, str):
+        stripped = item.strip()
+        parsed = None
+        if stripped:
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                parsed = None
+        if isinstance(parsed, dict):
+            row = parsed
+        else:
+            row = {"_raw_value": item, "_raw_type": "str"}
+    elif isinstance(item, list):
+        row = {"_raw_value": json.dumps(item, ensure_ascii=False), "_raw_type": "list"}
+    else:
+        row = {"_raw_value": item, "_raw_type": type(item).__name__}
+
+    if COUNTRY_FIELD not in row or not row.get(COUNTRY_FIELD):
+        row[COUNTRY_FIELD] = country_code
+    return row
+
+
+def to_ddmmyyyy(value) -> str:
+    text = flatten_for_humans(value).strip()
     if not text:
         return ""
-    dt = pd.to_datetime(text, errors="coerce", utc=True)
-    if pd.isna(dt):
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return dt.strftime("%d.%m.%Y")
+    except ValueError:
         return ""
-    return dt.strftime("%d.%m.%Y")
 
 
-def extract_from_structured(value: str, key: str) -> str:
-    parsed = parse_structured_value(value if isinstance(value, str) else "")
+def extract_from_structured(value, key: str) -> str:
+    parsed = parse_structured_value(value)
     if isinstance(parsed, dict):
-        val = parsed.get(key, "")
-        return flatten_for_humans(val)
+        return flatten_for_humans(parsed.get(key, ""))
     if isinstance(parsed, list):
         values = []
         for item in parsed:
             if isinstance(item, dict) and key in item:
-                text = flatten_for_humans(item.get(key))
+                text = flatten_for_humans(item.get(key, ""))
                 if text:
                     values.append(text)
         if values:
-            # Убираем дубликаты с сохранением порядка.
             return " | ".join(list(dict.fromkeys(values)))
     return ""
 
 
-def status_from_row(row: pd.Series) -> str:
-    end_date_raw = str(row.get("docValidityDate.$date", "") or "").strip()
-    status_code = str(row.get("docStatusDetails.docStatusCode", "") or "").strip()
-    note_text = str(row.get("docStatusDetails.noteText", "") or "").strip().lower()
+def status_from_record(record: dict) -> str:
+    end_date_raw = get_date_value(record, "docValidityDate")
+    status_code = flatten_for_humans(get_value(record, "docStatusDetails.docStatusCode", "")).strip()
+    note_text = flatten_for_humans(get_value(record, "docStatusDetails.noteText", "")).strip().lower()
 
-    end_dt = pd.to_datetime(end_date_raw, errors="coerce", utc=True)
-    now = datetime.now(timezone.utc)
-    if pd.notna(end_dt):
-        return "действует" if end_dt >= now else "прекращен"
+    end_text = flatten_for_humans(end_date_raw).strip()
+    if end_text:
+        try:
+            end_dt = datetime.fromisoformat(end_text.replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+            return "действует" if end_dt >= now else "прекращен"
+        except ValueError:
+            pass
 
     if "прекращ" in note_text:
         return "прекращен"
-
     if status_code in {"09", "10"}:
         return "прекращен"
     if status_code:
@@ -343,128 +363,138 @@ def status_from_row(row: pd.Series) -> str:
     return ""
 
 
-def to_selected_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    work = df.copy()
+def record_to_selected_row(record: dict) -> dict[str, str]:
+    country_code = flatten_for_humans(get_value(record, COUNTRY_FIELD, "")).strip()
 
-    work["Регистрационный номер документа"] = work.get("docId", "").fillna("").astype(str)
-    work["Страна"] = (
-        work.get(COUNTRY_FIELD, "").fillna("").astype(str).map(lambda x: COUNTRY_NAMES_RU.get(x.strip(), x.strip()))
+    applicant = flatten_for_humans(get_value(record, "applicantDetails.businessEntityName", ""))
+    manufacturer = extract_from_structured(
+        get_value(record, "technicalRegulationObjectDetails.manufacturerDetails", ""),
+        "businessEntityName",
     )
-    work["Вид документа"] = work.get("conformityDocKindName", "").fillna("").astype(str)
+    if not manufacturer:
+        manufacturer = applicant
 
-    start = work.get("docStartDate.$date", "").fillna("").astype(str).map(to_ddmmyyyy)
-    end = work.get("docValidityDate.$date", "").fillna("").astype(str).map(to_ddmmyyyy)
-    work["Срок действия"] = [
-        f"{s} - {e}" if s and e else (s or e) for s, e in zip(start.tolist(), end.tolist())
-    ]
+    start = to_ddmmyyyy(get_date_value(record, "docStartDate"))
+    end = to_ddmmyyyy(get_date_value(record, "docValidityDate"))
+    term = f"{start} - {end}" if start and end else (start or end)
 
-    work["Заявитель"] = work.get("applicantDetails.businessEntityName", "").fillna("").astype(str)
+    return {
+        "Регистрационный номер документа": flatten_for_humans(get_value(record, "docId", "")),
+        "Страна": COUNTRY_NAMES_RU.get(country_code, country_code),
+        "Вид документа": flatten_for_humans(get_value(record, "conformityDocKindName", "")),
+        "Срок действия": term,
+        "Заявитель": applicant,
+        "Изготовитель": manufacturer,
+        "Технический регламент": flatten_for_humans(
+            parse_structured_value(get_value(record, "technicalRegulationId", ""))
+        ),
+        "Наименование органа по оценке соответствия": flatten_for_humans(
+            get_value(record, "conformityAuthorityV2Details.businessEntityName", "")
+        ),
+        "Статус действия": status_from_record(record),
+    }
 
-    manufacturers = work.get("technicalRegulationObjectDetails.manufacturerDetails", "").fillna("").astype(str)
-    work["Изготовитель"] = manufacturers.map(lambda v: extract_from_structured(v, "businessEntityName"))
-    work["Изготовитель"] = work["Изготовитель"].where(
-        work["Изготовитель"].str.strip().astype(bool),
-        work.get("applicantDetails.businessEntityName", "").fillna("").astype(str),
+
+def extract_rest_data(payload: object) -> list[object]:
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        data = payload.get("data") or payload.get("items") or payload.get("result") or []
+        return data if isinstance(data, list) else [data]
+    return [payload]
+
+
+def fetch_batch(
+    session: requests.Session,
+    country_code: str,
+    limit: int,
+    skip: int,
+) -> list[object]:
+    headers = {"Content-Type": "text/plain"}
+    query_payload = {
+        "$and": [
+            {
+                COUNTRY_FIELD: {
+                    "$eq": country_code,
+                }
+            }
+        ]
+    }
+    url = f"{BASE_URL}?collection={COLLECTION_NAME}&limit={limit}&skip={skip}"
+    response = session.post(
+        url,
+        headers=headers,
+        data=json.dumps(query_payload),
+        timeout=REQUEST_TIMEOUT_SECONDS,
     )
-
-    work["Технический регламент"] = (
-        work.get("technicalRegulationId", "").fillna("").astype(str).map(parse_structured_value).map(flatten_for_humans)
-    )
-
-    work["Наименование органа по оценке соответствия"] = (
-        work.get("conformityAuthorityV2Details.businessEntityName", "").fillna("").astype(str)
-    )
-
-    work["Статус действия"] = work.apply(status_from_row, axis=1)
-
-    selected_cols = [
-        "Регистрационный номер документа",
-        "Страна",
-        "Вид документа",
-        "Срок действия",
-        "Заявитель",
-        "Изготовитель",
-        "Технический регламент",
-        "Наименование органа по оценке соответствия",
-        "Статус действия",
-    ]
-    result = work[selected_cols].copy()
-    result = result.fillna("")
-    return result
+    response.raise_for_status()
+    return extract_rest_data(response.json())
 
 
-def to_readable_dataframe(df: pd.DataFrame, empty_threshold: float) -> pd.DataFrame:
-    readable = df.copy()
+def stream_country(
+    session: requests.Session,
+    country_code: str,
+    limit: int,
+    sleep_seconds: float,
+    writer: CsvPartWriter,
+) -> int:
+    total_written = 0
+    skip = 0
+    batch_count = 1
+    server_page_cap_detected = False
 
-    for col in readable.columns:
-        readable[col] = readable[col].fillna("").map(parse_structured_value).map(flatten_for_humans)
+    print(f"\nСтарт выгрузки страны {country_code} (limit={limit})")
 
-        if col.endswith(".$date"):
-            parsed = pd.to_datetime(readable[col], errors="coerce", utc=True)
-            if parsed.notna().any():
-                readable[col] = parsed.dt.strftime("%Y-%m-%d %H:%M").fillna("")
+    while True:
+        try:
+            data = fetch_batch(session, country_code, limit, skip)
+        except requests.RequestException as exc:
+            print(
+                f"{country_code}: ошибка сети на skip={skip}: {exc}. "
+                "Повторю через паузу."
+            )
+            time.sleep(max(2.0, sleep_seconds))
+            continue
 
-    technical_prefixes = ("_sys", "_class", "_source", "masterId.$binary", "_id.$oid")
-    keep_cols = [
-        c for c in readable.columns if not any(c.startswith(prefix) for prefix in technical_prefixes)
-    ]
-    readable = readable[keep_cols]
+        if not data:
+            print(f"{country_code}: данные закончились.")
+            break
 
-    if len(readable):
-        empty_share = (readable == "").sum() / len(readable)
-        drop_cols = [c for c in readable.columns if float(empty_share[c]) >= empty_threshold]
-        if drop_cols:
-            readable = readable.drop(columns=drop_cols)
+        rows = []
+        for item in data:
+            record = normalize_record(item, country_code)
+            rows.append(record_to_selected_row(record))
 
-    rename_map = {c: c.replace(".$date", " date").replace(".", " / ") for c in readable.columns}
-    readable = readable.rename(columns=rename_map)
+        if rows:
+            writer.write_rows(rows)
+            total_written += len(rows)
 
-    preferred = [
-        "unifiedCountryCode / value",
-        "docId",
-        "formNumberId",
-        "conformityDocKindName",
-        "docStartDate date",
-        "docValidityDate date",
-        "applicantDetails / businessEntityName",
-    ]
-    first = [c for c in preferred if c in readable.columns]
-    other = [c for c in readable.columns if c not in first]
-    return readable[first + other]
-
-
-def save_csv_in_parts(df: pd.DataFrame, filename: str, max_rows_per_file: int) -> None:
-    if max_rows_per_file <= 0:
-        raise ValueError("--max-rows-per-file должен быть больше 0.")
-
-    if len(df) <= max_rows_per_file:
-        df.to_csv(filename, index=False, sep=";", encoding="utf-8-sig")
-        print(f"\nИтог: {len(df)} записей сохранено в {filename}")
-        return
-
-    if "." in filename:
-        base, ext = filename.rsplit(".", 1)
-        ext = f".{ext}"
-    else:
-        base, ext = filename, ".csv"
-
-    total_parts = (len(df) + max_rows_per_file - 1) // max_rows_per_file
-    for part_index in range(total_parts):
-        start = part_index * max_rows_per_file
-        end = min(start + max_rows_per_file, len(df))
-        chunk = df.iloc[start:end]
-        part_name = f"{base}_part{part_index + 1:03d}{ext}"
-        chunk.to_csv(part_name, index=False, sep=";", encoding="utf-8-sig")
         print(
-            f"Сохранен файл {part_name}: строк {len(chunk)} "
-            f"(диапазон {start + 1}-{end})"
+            f"{country_code} | пачка #{batch_count}: получено {len(data)} записей "
+            f"(skip={skip}), записано {len(rows)}"
         )
 
-    print(f"\nИтог: {len(df)} записей сохранено в {total_parts} файлов.")
+        if len(data) < limit and not server_page_cap_detected:
+            print(
+                f"{country_code}: сервер вернул {len(data)} < limit={limit}. "
+                "Продолжаю пагинацию до пустого ответа."
+            )
+            server_page_cap_detected = True
+
+        skip += len(data)
+        batch_count += 1
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+
+    print(f"{country_code}: всего записано {total_written} строк.")
+    return total_written
 
 
 def main() -> None:
     args = parse_args()
+
+    if args.limit <= 0:
+        raise ValueError("--limit должен быть больше 0.")
 
     if not args.countries.strip() or args.countries.upper() == "ASK":
         countries = ask_countries_interactive()
@@ -473,28 +503,34 @@ def main() -> None:
 
     print(f"Страны для выгрузки: {', '.join(countries)}")
 
-    all_records: list[dict] = []
-    for country in countries:
-        country_records = fetch_data_for_country(country, args.limit, args.sleep)
-        all_records.extend(records_to_dicts(country_records, country))
+    filename = output_name(countries, args.output)
+    writer = CsvPartWriter(filename, args.max_rows_per_file, OUTPUT_COLUMNS)
+    session = create_http_session()
 
-    if not all_records:
+    total = 0
+    try:
+        for country in countries:
+            total += stream_country(
+                session=session,
+                country_code=country,
+                limit=args.limit,
+                sleep_seconds=args.sleep,
+                writer=writer,
+            )
+    finally:
+        writer.close()
+        session.close()
+
+    if total == 0:
         print("Данные не получены.")
         return
 
-    all_records = ensure_dict_records(all_records)
-    df = pd.json_normalize(all_records)
-    if COUNTRY_FIELD in df.columns:
-        df = df.sort_values(by=[COUNTRY_FIELD], ascending=True, kind="stable")
-
-    filename = output_name(countries, args.output)
-    selected_df = to_selected_dataframe(df)
-    save_csv_in_parts(selected_df, filename, args.max_rows_per_file)
-
-    if args.readable_output:
-        readable_df = to_readable_dataframe(df, args.readable_drop_empty_threshold)
-        readable_name = readable_output_name(filename)
-        save_csv_in_parts(readable_df, readable_name, args.max_rows_per_file)
+    if len(writer.files_created) == 1:
+        print(f"\nИтог: {total} записей сохранено в {writer.files_created[0]}")
+    else:
+        print(f"\nИтог: {total} записей сохранено в {len(writer.files_created)} файлов.")
+        for path in writer.files_created:
+            print(f" - {path}")
 
 
 if __name__ == "__main__":
